@@ -18,16 +18,9 @@ namespace HidWizards.UCR.Core.Managers
             _profiles = profiles;
         }
 
-        public Profile CreateProfile()
+        public Profile CreateProfile(string title, List<DeviceConfiguration> inputDevices, List<DeviceConfiguration> outputDevices)
         {
-            return Profile.CreateProfile(_context, "");
-        }
-
-        public bool AddProfile(string title)
-        {
-            _profiles.Add(Profile.CreateProfile(_context, title));
-            _context.ContextChanged();
-            return true;
+            return Profile.CreateProfile(_context, title, inputDevices, outputDevices);
         }
 
         public bool AddProfile(Profile newProfile, Profile parentProfile = null)
@@ -60,6 +53,11 @@ namespace HidWizards.UCR.Core.Managers
             {
                 _profiles.Add(newProfile);
             }
+
+            // TODO Fix Configuration Guid and referenced DeviceBinding Guids
+            //newProfile.InputDeviceConfigurations.ForEach(configuration => configuration.Guid = Guid.NewGuid());
+            //newProfile.OutputDeviceConfigurations.ForEach(configuration => configuration.Guid = Guid.NewGuid());
+
             _context.ContextChanged();
 
             return true;

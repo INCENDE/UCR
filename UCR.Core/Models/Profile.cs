@@ -1,44 +1,30 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Xml.Serialization;
+using HidWizards.UCR.Core.Annotations;
 using HidWizards.UCR.Core.Models.Binding;
 using NLog;
 
 namespace HidWizards.UCR.Core.Models
 {
-    public class Profile
+    public class Profile : INotifyPropertyChanged
     {
         private static readonly Logger Logger = LogManager.GetCurrentClassLogger();
 
         /* Persistence */
+        [XmlAttribute]
         public string Title { get; set; }
+        [XmlAttribute]
         public Guid Guid { get; set; }
         public List<Profile> ChildProfiles { get; set; }
-        public List<State> States { get; set; }
         public List<Mapping> Mappings { get; set; }
-        public Guid InputDeviceGroupGuid { get; set; }
-        public Guid OutputDeviceGroupGuid { get; set; }
 
-        /* Property helpers */
-        [XmlIgnore]
-        public List<State> AllStates
-        {
-            get
-            {
-                var list = new List<State>
-                {
-                    new State
-                    {
-                        Guid = Guid.Empty,
-                        Title = "Default"
-                    }
-                };
-                list.AddRange(States);
-                return list;
-            }
-        }
+        public List<DeviceConfiguration> InputDeviceConfigurations { get; set; }
+        public List<DeviceConfiguration> OutputDeviceConfigurations { get; set; }
 
 
         /* Runtime */
@@ -46,7 +32,6 @@ namespace HidWizards.UCR.Core.Models
         public Context Context;
         [XmlIgnore]
         public Profile ParentProfile { get; set; }
-        internal ConcurrentDictionary<Guid, bool> StateDictionary { get; set; }
 
         #region Constructors
 
@@ -65,8 +50,9 @@ namespace HidWizards.UCR.Core.Models
         {
             Guid = Guid.NewGuid();
             ChildProfiles = new List<Profile>();
-            States = new List<State>();
             Mappings = new List<Mapping>();
+            InputDeviceConfigurations = new List<DeviceConfiguration>();
+            OutputDeviceConfigurations = new List<DeviceConfiguration>();
         }
 
         public Profile(Context context, Profile parentProfile = null) : this(context)
@@ -78,21 +64,17 @@ namespace HidWizards.UCR.Core.Models
 
         #region Actions
 
-        public static Profile CreateProfile(Context context, string title, Profile parent = null)
+        public static Profile CreateProfile(Context context, string title, List<DeviceConfiguration> inputDevices,
+            List<DeviceConfiguration> outputDevices, Profile parent = null)
         {
             var profile = new Profile(context, parent)
             {
-                Title = title
+                Title = title,
+                InputDeviceConfigurations = inputDevices ?? new List<DeviceConfiguration>(),
+                OutputDeviceConfigurations = outputDevices ?? new List<DeviceConfiguration>()
             };
 
             return profile;
-        }
-
-        public void AddNewChildProfile(string title)
-        {
-            if (ChildProfiles == null) ChildProfiles = new List<Profile>();
-            ChildProfiles.Add(CreateProfile(Context, title, this));
-            Context.ContextChanged();
         }
 
         public void AddChildProfile(Profile profile)
@@ -124,22 +106,6 @@ namespace HidWizards.UCR.Core.Models
             Context.ContextChanged();
         }
 
-        public void SetDeviceGroup(DeviceIoType ioType, Guid deviceGroupGuid)
-        {
-            switch (ioType)
-            {
-                case DeviceIoType.Input:
-                    InputDeviceGroupGuid = deviceGroupGuid;
-                    break;
-                case DeviceIoType.Output:
-                    OutputDeviceGroupGuid = deviceGroupGuid;
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(ioType), ioType, null);
-            }
-            Context.ContextChanged();
-        }
-
         public bool ActivateProfile()
         {
             return Context.SubscriptionsManager.ActivateProfile(this);
@@ -147,13 +113,12 @@ namespace HidWizards.UCR.Core.Models
 
         public bool Deactivate()
         {
-            return Context.SubscriptionsManager.DeactivateProfile();
+            return Context.SubscriptionsManager.DeactivateCurrentProfile();
         }
 
         internal void PrepareProfile()
         {
-            StateDictionary = new ConcurrentDictionary<Guid, bool>();
-            States.ForEach(s => StateDictionary.TryAdd(s.Guid, false));
+            
         }
 
         #endregion
@@ -179,57 +144,79 @@ namespace HidWizards.UCR.Core.Models
 
         #region Device
 
-        public Device GetDevice(DeviceBinding deviceBinding)
+        public DeviceConfiguration GetDeviceConfiguration(DeviceIoType deviceIoType, Guid deviceConfigurationGuid)
         {
-            var deviceList = GetDeviceList(deviceBinding);
-            return deviceList.FirstOrDefault(d => d.Guid == deviceBinding.DeviceGuid);
+            var deviceList = GetDeviceConfigurationList(deviceIoType);
+            return deviceList.FirstOrDefault(configuration => configuration.Guid == deviceConfigurationGuid);
         }
 
-        public List<Device> GetDeviceList(DeviceBinding deviceBinding)
+        public List<DeviceConfiguration> GetDeviceConfigurationList(DeviceIoType deviceIoType)
         {
-            return GetDeviceList(deviceBinding.DeviceIoType);
+            var result = new List<DeviceConfiguration>();
+            if (ParentProfile != null) result.AddRange(ParentProfile.GetDeviceConfigurationList(deviceIoType));
+
+            var devices = deviceIoType == DeviceIoType.Input ? InputDeviceConfigurations : OutputDeviceConfigurations;
+            devices.ForEach(d => d.Device.Profile = this);
+            result.AddRange(devices);
+
+            return result;
         }
 
-        public List<Device> GetDeviceList(DeviceIoType deviceIoType)
+        public List<Device> GetMissingDeviceList(DeviceIoType deviceIoType)
         {
-            return GetDeviceGroup(deviceIoType)?.Devices ?? new List<Device>();
-        }
+            Context.DevicesManager.RefreshDeviceList();
+            var availableDeviceList = Context.DevicesManager.GetAvailableDeviceList(deviceIoType);
+            var profileDeviceList = GetDeviceConfigurationList(deviceIoType);
 
-        public DeviceGroup GetDeviceGroup(DeviceIoType deviceIoType)
-        {
-            var deviceGroupGuid = GetDeviceGroupGuid(deviceIoType);
-            if (deviceGroupGuid.Equals(Guid.Empty))
+            foreach (var deviceConfiguration in profileDeviceList)
             {
-                return ParentProfile?.GetDeviceGroup(deviceIoType);
+                availableDeviceList.RemoveAll(d => d.Equals(deviceConfiguration.Device));
             }
-            return Context.DeviceGroupsManager.GetDeviceGroup(deviceIoType, deviceGroupGuid);
+
+            return availableDeviceList;
         }
 
-        public string GetInheritedDeviceGroupName(DeviceIoType deviceIoType)
+        public void AddDeviceConfigurations(List<DeviceConfiguration> deviceConfigurations, DeviceIoType deviceIoType)
         {
-            var parentDeviceGroupName = "None";
-            var parentDeviceGroup = ParentProfile?.GetDeviceGroup(deviceIoType);
-            if (parentDeviceGroup != null) parentDeviceGroupName = parentDeviceGroup.Title;
-            if (ParentProfile != null) parentDeviceGroupName += " (Inherited)";
-            return parentDeviceGroupName;
+            deviceConfigurations.ForEach(configuration => configuration.Device.Profile = this);
+            var deviceList = deviceIoType == DeviceIoType.Input ? InputDeviceConfigurations : OutputDeviceConfigurations;
+
+            deviceList.AddRange(deviceConfigurations);
+            OnPropertyChanged(deviceIoType == DeviceIoType.Input ? nameof(InputDeviceConfigurations) : nameof(OutputDeviceConfigurations));
+            Context.ContextChanged();
         }
 
+        public bool RemoveDeviceConfiguration(DeviceConfiguration device)
+        {
+            var success = InputDeviceConfigurations.Remove(device) || OutputDeviceConfigurations.Remove(device);
+            if (success)
+            {
+                OnPropertyChanged(nameof(InputDeviceConfigurations));
+                OnPropertyChanged(nameof(OutputDeviceConfigurations));
+                Context.ContextChanged();
+            }
+
+            return success;
+        }
+
+        public bool CanRemoveDeviceConfiguration(DeviceConfiguration device)
+        {
+            return InputDeviceConfigurations.Contains(device) || OutputDeviceConfigurations.Contains(device);
+
+        }
         #endregion
 
         #region Plugin
 
-        public bool AddNewPlugin(Mapping mapping, Plugin plugin, Guid? state = null)
+        public bool AddNewPlugin(Mapping mapping, Plugin plugin)
         {
-            return AddPlugin(mapping, (Plugin)Activator.CreateInstance(plugin.GetType()), state);
+            return AddPlugin(mapping, (Plugin)Activator.CreateInstance(plugin.GetType()));
         }
 
-        public bool AddPlugin(Mapping mapping, Plugin plugin, Guid? state = null)
+        public bool AddPlugin(Mapping mapping, Plugin plugin)
         {
             if (!Mappings.Contains(mapping)) return false;
-            plugin.State = state ?? Guid.Empty;
-            plugin.Profile = this;
-            mapping.Plugins.Add(plugin);
-            Context.ContextChanged();
+            mapping.AddPlugin(plugin);
             return true;
         }
 
@@ -243,46 +230,25 @@ namespace HidWizards.UCR.Core.Models
 
         #endregion
 
-        #region State
-
-        public State AddState(string title)
+        public HashSet<string> GetFilters()
         {
-            if (States.Find(s => s.Title == title) != null) return null;
-            var newState = new State(title);
-            States.Add(newState);
-            Context.ContextChanged();
-            return newState;
-        }
+            var result = ParentProfile != null
+                ? ParentProfile.GetFilters()
+                : new HashSet<string>(StringComparer.InvariantCultureIgnoreCase);
 
-        public bool RemoveState(State state)
-        {
-            var success = States.Remove(state);
-            // TODO remove all plugins with state
-
-            Context.ContextChanged();
-            return success;
-        }
-
-        public string GetStateTitle(Guid stateGuid)
-        {
-            var state = States.Find(s => s.Guid == stateGuid);
-            return state == null ? "" : state.Title;
-        }
-
-        public void SetRuntimeState(Guid stateGuid, bool newState)
-        {
-            if (StateDictionary.TryGetValue(stateGuid, out var currentState))
+            foreach (var mapping in Mappings)
             {
-                StateDictionary.TryUpdate(stateGuid, newState, currentState);
+                foreach (var plugin in mapping.Plugins)
+                {
+                    foreach (var filter in plugin.Filters)
+                    {
+                        result.Add(filter.Name);
+                    }
+                }
             }
-        }
 
-        public bool GetRuntimeState(Guid stateGuid)
-        {
-            return StateDictionary.TryGetValue(stateGuid, out var currentState) && currentState;
+            return result;
         }
-
-        #endregion
 
         #region Helpers
 
@@ -298,19 +264,6 @@ namespace HidWizards.UCR.Core.Models
         public bool IsActive()
         {
             return Context.SubscriptionsManager.GetActiveProfile() != null && Context.SubscriptionsManager.GetActiveProfile().Guid == Guid;
-        }
-
-        private Guid GetDeviceGroupGuid(DeviceIoType deviceIoType)
-        {
-            switch (deviceIoType)
-            {
-                case DeviceIoType.Input:
-                    return InputDeviceGroupGuid;
-                case DeviceIoType.Output:
-                    return OutputDeviceGroupGuid;
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(deviceIoType), deviceIoType, null);
-            }
         }
 
         #endregion
@@ -329,6 +282,14 @@ namespace HidWizards.UCR.Core.Models
             {
                 mapping.PostLoad(context, this);
             }
+        }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        [NotifyPropertyChangedInvocator]
+        protected virtual void OnPropertyChanged([CallerMemberName] string propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
     }
 }

@@ -1,10 +1,14 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
 using System.Xml.Serialization;
 using HidWizards.UCR.Core.Attributes;
 using HidWizards.UCR.Core.Models.Binding;
+using HidWizards.UCR.Core.Models.Subscription;
 
 namespace HidWizards.UCR.Core.Models
 {
@@ -12,17 +16,19 @@ namespace HidWizards.UCR.Core.Models
     public abstract class Plugin : IComparable<Plugin>
     {
         /* Persistence */
-        public Guid State { get; set; }
         public List<DeviceBinding> Outputs { get; }
+        public List<Filter> Filters { get; set; }
         
         /* Runtime */
         internal Profile Profile { get; set; }
         private List<IODefinition> _inputCategories;
         private List<IODefinition> _outputCategories;
-        private List<List<PluginProperty>> _guiMatrix;
+        private List<PluginPropertyGroup> _pluginPropertyGroups;
+        internal FilterState FilterState { get; set; }
+        internal Mapping RuntimeMapping { get; set; }
 
         #region Properties
-        
+
         [XmlIgnore]
         public List<IODefinition> InputCategories
         {
@@ -46,26 +52,24 @@ namespace HidWizards.UCR.Core.Models
         }
 
         [XmlIgnore]
-        public List<List<PluginProperty>> GuiMatrix
+        public List<PluginPropertyGroup> PluginPropertyGroups
         {
             get
             {
-                if (_guiMatrix != null) return _guiMatrix;
-                _guiMatrix = GetGuiMatrix();
-                return _guiMatrix;
+                if (_pluginPropertyGroups != null) return _pluginPropertyGroups;
+                _pluginPropertyGroups = GetGuiMatrix();
+                return _pluginPropertyGroups;
             }
         }
 
         [XmlIgnore]
-        public string PluginName => State.Equals(Guid.Empty) ? GetPluginAttribute().Name : $"{GetPluginAttribute().Name} - State: {StateTitle}";
-
+        public string PluginName =>  GetPluginAttribute().Name;
+        [XmlIgnore]
+        public string Description => GetPluginAttribute().Description;
+        [XmlIgnore]
+        public string Group => GetPluginAttribute().Group;
         [XmlIgnore]
         public bool IsDisabled => GetPluginAttribute().Disabled;
-
-        public string StateTitle
-        {
-            get => Profile.GetStateTitle(State);
-        }
 
         #endregion
 
@@ -73,6 +77,15 @@ namespace HidWizards.UCR.Core.Models
         {
             public string Name;
             public DeviceBindingCategory Category;
+            public string GroupName;
+        }
+
+        public enum FilterMode
+        {
+            Active,
+            Inactive,
+            Toggle,
+            Unchanged
         }
 
         protected Plugin()
@@ -82,6 +95,8 @@ namespace HidWizards.UCR.Core.Models
             {
                 Outputs.Add(new DeviceBinding(null, Profile, DeviceIoType.Output));
             }
+
+            Filters = new List<Filter>();
         }
 
         #region Life cycle
@@ -123,23 +138,70 @@ namespace HidWizards.UCR.Core.Models
             Outputs[number].WriteOutput(value);
         }
 
-        protected void SetState(Guid stateGuid, bool newState)
-        {
-            Profile.SetRuntimeState(stateGuid, newState);
-        }
-
-        protected bool GetState(Guid stateGuid)
-        {
-            return Profile.GetRuntimeState(stateGuid);
-        }
-
         protected long ReadOutput(int number)
         {
             return Outputs[number].CurrentValue;
         }
 
+        protected void WriteFilterState(string filterName, bool value)
+        {
+            RuntimeMapping.FilterState.SetFilterState(GetFilterName(filterName), value);
+        }
+
+        protected void ToggleFilterState(string filterName)
+        {
+            RuntimeMapping.FilterState.ToggleFilterState(GetFilterName(filterName));
+        }
+
+        private string GetFilterName(string filterName)
+        {
+            var filter = filterName.ToLower();
+            return RuntimeMapping.IsShadowMapping 
+                ? Filter.GetShadowName(filter, RuntimeMapping.ShadowDeviceNumber) 
+                : filter;
+        }
+
         #endregion
-        
+
+        #region Filters
+
+        internal Filter AddFilter(string name, bool negative = false)
+        {
+            var existingFilter = Filters.Find(f => string.Equals(f.Name, name, StringComparison.CurrentCultureIgnoreCase));
+
+            if (existingFilter != null)
+            {
+                existingFilter.Negative = negative;
+                ContextChanged();
+                return existingFilter;
+            }
+            
+            var filter = new Filter()
+            {
+                Name = name,
+                Negative = negative
+            };
+            
+            Filters.Add(filter);
+            ContextChanged();
+            return filter;
+        }
+
+        internal bool RemoveFilter(Filter filter)
+        {
+            var success = Filters.Remove(filter);
+            if (success) ContextChanged();
+            return success;
+        }
+
+        internal void ToggleFilter(Filter filter)
+        {
+            var existingFilter = Filters.Find(f => string.Equals(f.Name, filter.Name, StringComparison.InvariantCultureIgnoreCase));
+            if (existingFilter != null) AddFilter(existingFilter.Name, !existingFilter.Negative);
+        }
+
+        #endregion
+
         public void SetProfile(Profile profile)
         {
             Profile = profile;
@@ -175,7 +237,7 @@ namespace HidWizards.UCR.Core.Models
             for (var i = 0; i < split; i++)
             {
                 deviceBindings[i].IsBound = deviceBindings[i + split].IsBound;
-                deviceBindings[i].DeviceGuid = deviceBindings[i + split].DeviceGuid;
+                deviceBindings[i].DeviceConfigurationGuid = deviceBindings[i + split].DeviceConfigurationGuid;
                 deviceBindings[i].KeyType = deviceBindings[i + split].KeyType;
                 deviceBindings[i].KeyValue = deviceBindings[i + split].KeyValue;
                 deviceBindings[i].KeySubValue = deviceBindings[i + split].KeySubValue;
@@ -225,7 +287,8 @@ namespace HidWizards.UCR.Core.Models
             return attributes.Where(a => a.DeviceIoType == deviceIoType).Select(a => new IODefinition()
             {
                 Category = a.DeviceBindingCategory,
-                Name = a.Name
+                Name = a.Name,
+                GroupName = a.Group
             }).ToList();
         }
 
@@ -237,37 +300,81 @@ namespace HidWizards.UCR.Core.Models
                 select new { Property = p, Attribute = attr.First() as PluginGuiAttribute };
 
 
-            return properties.Select(prop => new PluginProperty(this, prop.Property, prop.Attribute.Name, prop.Attribute.RowOrder, prop.Attribute.ColumnOrder)).ToList();
+            return properties.Select(prop => new PluginProperty(this, prop.Property, prop.Attribute.Name, prop.Attribute.Order, prop.Attribute.Group)).ToList();
         }
 
-        public List<List<PluginProperty>> GetGuiMatrix()
+        private List<PluginGroupAttribute> GetPluginGroups()
         {
-            var result = new List<List<PluginProperty>>();
-            var currentRow = new List<PluginProperty>();
-            result.Add(currentRow);
+            return GetType().GetCustomAttributes(typeof(PluginGroupAttribute), true).ToList()
+                .Select(a => ((PluginGroupAttribute) a)).ToList();
+        }
 
+        private List<string> GetPluginOutputGroups()
+        {
+            return GetType().GetCustomAttributes(typeof(PluginOutput), true).ToList()
+                .Select(a => ((PluginOutput)a).Group).Distinct().ToList();
+        }
+
+        public List<PluginPropertyGroup> GetGuiMatrix()
+        {
+            var result = new List<PluginPropertyGroup>();
+            
             var guiProperties = GetGuiProperties();
             guiProperties.Sort();
 
-            foreach (var pluginProperty in guiProperties)
-            {
-                if (currentRow.Count != 0 && currentRow[0].RowOrder != pluginProperty.RowOrder)
+            var ungroupedProperties = guiProperties.FindAll(p => p.Group == null);
+            if (ungroupedProperties.Count > 0) { 
+                result.Add(new PluginPropertyGroup()
                 {
-                    currentRow = new List<PluginProperty>();
-                    result.Add(currentRow);
-                }
-
-                currentRow.Add(pluginProperty);
+                    Title = "Settings",
+                    GroupName = "Settings",
+                    GroupType = PluginPropertyGroup.GroupTypes.Settings,
+                    PluginProperties = ungroupedProperties
+                });
             }
 
-            foreach (var pluginPropertiesRow in result)
+            foreach (var group in GetPluginGroups())
             {
-                pluginPropertiesRow.Sort((x, y) => x.ColumnOrder.CompareTo(y.ColumnOrder));
+                if (group.Group == null) continue;
+
+                var properties = guiProperties.FindAll(p => group.Group.Equals(p.Group));
+                result.Add(new PluginPropertyGroup()
+                {
+                    Title = group.Name,
+                    GroupName = group.Group,
+                    GroupType = GetPluginOutputGroups().Contains(group.Group) 
+                        ? PluginPropertyGroup.GroupTypes.Output 
+                        : PluginPropertyGroup.GroupTypes.Settings,
+                    PluginProperties = properties
+                });
+            }
+
+            foreach (var pluginGroup in result)
+            {
+                pluginGroup.PluginProperties.Sort((x, y) => x.Order.CompareTo(y.Order));
             }
 
             return result;
         }
 
         #endregion
+
+        public virtual PropertyValidationResult Validate(PropertyInfo propertyInfo, dynamic value)
+        {
+            return PropertyValidationResult.ValidResult;
+        }
+
+        public bool IsFiltered()
+        {
+            if (Filters.Count == 0) return false;
+
+            foreach (var filter in Filters)
+            {
+                RuntimeMapping.FilterState.FilterRuntimeDictionary.TryGetValue(filter.Name.ToLower(), out var filterValue);
+                if (!(filterValue ^ filter.Negative)) return true;
+            }
+
+            return false;
+        }
     }
 }

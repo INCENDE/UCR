@@ -1,7 +1,10 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using HidWizards.UCR.Core.Models;
 using HidWizards.UCR.Core.Models.Binding;
 using HidWizards.UCR.Utilities.Commands;
@@ -33,7 +36,6 @@ namespace HidWizards.UCR.Views.Controls
         private void UserControl_Loaded(object sender, RoutedEventArgs e)
         {
             if (DeviceBinding == null) return; // TODO Error logging
-            DeviceBindingLabel.Header = Label;
             ReloadGui();
             HasLoaded = true;
         }
@@ -53,27 +55,30 @@ namespace HidWizards.UCR.Views.Controls
         private void BuildContextMenu()
         {
             BindMenu = new ObservableCollection<ContextMenuItem>();
-            var device = DeviceBinding.Profile.GetDevice(DeviceBinding);
-            if (device == null) return;
-            BindMenu = BuildMenu(device.GetDeviceBindingMenu(DeviceBinding.Profile.Context, DeviceBinding.DeviceIoType));
+            var deviceConfiguration = GetSelectedDeviceConfiguration();
+            if (deviceConfiguration == null) return;
+            BindMenu = BuildMenu(deviceConfiguration.Device.GetDeviceBindingMenu(DeviceBinding.Profile.Context, DeviceBinding.DeviceIoType));
+            BindMenu.Add(CreateClearCommandMenuItem());
         }
 
         private ObservableCollection<ContextMenuItem> BuildMenu(List<DeviceBindingNode> deviceBindingNodes)
         {
             var menuList = new ObservableCollection<ContextMenuItem>();
             if (deviceBindingNodes == null) return menuList;
+
             foreach (var deviceBindingNode in deviceBindingNodes)
             {
-                
                 RelayCommand cmd = null;
                 if (deviceBindingNode.IsBinding)
                 {
-                    if (Category != null && deviceBindingNode.DeviceBinding.DeviceBindingCategory != Category) continue;
+                    if (Category != null && deviceBindingNode.DeviceBindingInfo.DeviceBindingCategory != Category) continue;
                     cmd = new RelayCommand(c =>
                     {
-                        DeviceBinding.SetKeyTypeValue(deviceBindingNode.DeviceBinding.KeyType, deviceBindingNode.DeviceBinding.KeyValue, deviceBindingNode.DeviceBinding.KeySubValue);
+                        DeviceBinding.SetDeviceConfigurationGuid(GetSelectedDeviceConfiguration().Guid);
+                        DeviceBinding.SetKeyTypeValue(deviceBindingNode.DeviceBindingInfo.KeyType, deviceBindingNode.DeviceBindingInfo.KeyValue, deviceBindingNode.DeviceBindingInfo.KeySubValue);
                     });
                 }
+
                 var menu = new ContextMenuItem(deviceBindingNode.Title, BuildMenu(deviceBindingNode.ChildrenNodes), cmd);
                 if (deviceBindingNode.IsBinding || !deviceBindingNode.IsBinding && menu.Children.Count > 0)
                 {
@@ -81,7 +86,14 @@ namespace HidWizards.UCR.Views.Controls
                 }
                 
             }
+
             return menuList;
+        }
+
+        private ContextMenuItem CreateClearCommandMenuItem()
+        {
+            var clearCommand = new RelayCommand(c => { DeviceBinding.ClearBinding(); });
+            return new ContextMenuItem("Clear binding", null, clearCommand);
         }
 
         public DeviceBinding DeviceBinding
@@ -105,13 +117,24 @@ namespace HidWizards.UCR.Views.Controls
         private void DeviceNumberBox_OnSelected(object sender, RoutedEventArgs e)
         {
             if (!HasLoaded) return;
-            if (DeviceNumberBox.SelectedItem == null) return;
-            DeviceBinding.SetDeviceGuid(((ComboBoxItemViewModel)DeviceNumberBox.SelectedItem).Value);
+            if (DeviceSelectionBox.SelectedItem == null) return;
+            DeviceBinding.SetDeviceConfigurationGuid(GetSelectedDeviceConfiguration().Guid);
             LoadContextMenu();
+        }
+
+        private DeviceConfiguration GetSelectedDeviceConfiguration()
+        {
+            Guid guid = ((ComboBoxItemViewModel) DeviceSelectionBox.SelectedItem).Value;
+            return DeviceBinding.Profile.GetDeviceConfiguration(DeviceBinding.DeviceIoType, guid);
         }
 
         private void BindButton_OnClick(object sender, RoutedEventArgs e)
         {
+            if (e is KeyboardEventArgs && !((KeyEventArgs)e).Key.Equals(Key.Space))
+            {
+                e.Handled = true;
+                return;
+            }
             if (DeviceBinding.DeviceIoType.Equals(DeviceIoType.Input))
             {
                 if (DeviceBinding.IsInBindMode) return;

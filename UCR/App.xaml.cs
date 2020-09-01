@@ -65,7 +65,7 @@ namespace HidWizards.UCR
                 {
                     FileName = "UCR_unblocker.exe",
                     UseShellExecute = true,
-                    Arguments = Environment.CurrentDirectory,
+                    Arguments = $"\"{Environment.CurrentDirectory}\"",
                     CreateNoWindow = true
                 }
             };
@@ -141,6 +141,8 @@ namespace HidWizards.UCR
 
         private void App_OnExit(object sender, ExitEventArgs e)
         {
+            context?.DevicesManager.UpdateDeviceCache();
+
             Dispose();
         }
 

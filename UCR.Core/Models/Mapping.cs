@@ -1,15 +1,18 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Xml.Serialization;
 using HidWizards.UCR.Core.Models.Binding;
+using HidWizards.UCR.Core.Models.Subscription;
 
 namespace HidWizards.UCR.Core.Models
 {
     public class Mapping
     {
         /* Persistence */
+        [XmlAttribute]
         public string Title { get; set; }
-        public Guid Guid { get; set; }
         public List<DeviceBinding> DeviceBindings { get; set; }
         public List<Plugin> Plugins { get; set; }
 
@@ -17,6 +20,31 @@ namespace HidWizards.UCR.Core.Models
         private Profile Profile { get; set; }
         private List<short> InputCache { get; set; }
         private List<CallbackMultiplexer> Multiplexer { get; set; }
+        
+
+        internal bool IsShadowMapping { get; set; }
+        internal int ShadowDeviceNumber { get; set; }
+        internal int PossibleShadowClones => CountPossibleShadowClones();
+        internal FilterState FilterState { get; set; }
+
+        private int CountPossibleShadowClones()
+        {
+            var usedDeviceConfigurations = new List<DeviceConfiguration>();
+
+            foreach (var deviceBinding in DeviceBindings)
+            {
+                if (!deviceBinding.IsBound) continue;
+
+                var deviceConfiguration = Profile.GetDeviceConfiguration(DeviceIoType.Input, deviceBinding.DeviceConfigurationGuid);
+                if (deviceConfiguration != null) usedDeviceConfigurations.Add(deviceConfiguration);
+            }
+
+            if (usedDeviceConfigurations.Count == 0) return 0;
+
+            return usedDeviceConfigurations
+                .Select(deviceConfiguration => deviceConfiguration.ShadowDevices)
+                .Max(shadowDevices => shadowDevices.Count);
+        }
 
         [XmlIgnore]
         public string FullTitle
@@ -30,15 +58,23 @@ namespace HidWizards.UCR.Core.Models
 
         public Mapping()
         {
-            Guid = Guid.NewGuid();
             DeviceBindings = new List<DeviceBinding>();
             Plugins = new List<Plugin>();
+            
+            IsShadowMapping = false;
+            ShadowDeviceNumber = 0;
         }
 
         public Mapping(Profile profile, string title) : this()
         {
             Profile = profile;
             Title = title;
+        }
+
+        public void Rename(string title)
+        {
+            Title = title;
+            Profile.Context.ContextChanged();
         }
 
         internal bool IsBound()
@@ -52,7 +88,7 @@ namespace HidWizards.UCR.Core.Models
             return result;
         }
 
-        internal void PrepareMapping()
+        internal void PrepareMapping(FilterState filterState)
         {
             InputCache = new List<short>();
             DeviceBindings.ForEach(_ => InputCache.Add(0));
@@ -64,6 +100,9 @@ namespace HidWizards.UCR.Core.Models
                 DeviceBindings[i].Callback = cm.Update;
                 DeviceBindings[i].CurrentValue = 0;
             }
+
+            FilterState = filterState;
+            Plugins.ForEach(p => p.RuntimeMapping = this);
         }
 
         internal Mapping GetOverridenMapping()
@@ -80,6 +119,7 @@ namespace HidWizards.UCR.Core.Models
                 {
                     return mapping;
                 }
+
                 parentProfile = parentProfile?.ParentProfile;
                 if (parentProfile != null) list.AddRange(parentProfile.Mappings);
             }
@@ -91,10 +131,9 @@ namespace HidWizards.UCR.Core.Models
         {
             foreach (var plugin in Plugins)
             {
-                if (plugin.State == Guid.Empty || Profile.GetRuntimeState(plugin.State))
-                {
-                    plugin.Update(InputCache.ToArray());
-                }
+                if (plugin.IsFiltered()) continue;
+                
+                plugin.Update(InputCache.ToArray());
             }
         }
 
@@ -111,7 +150,7 @@ namespace HidWizards.UCR.Core.Models
             return plugins;
         }
 
-        public bool AddPlugin(Plugin plugin, Guid? state)
+        public bool AddPlugin(Plugin plugin)
         {
             if (Plugins.Count == 0)
             {
@@ -120,9 +159,8 @@ namespace HidWizards.UCR.Core.Models
                     DeviceBindings.Add(new DeviceBinding(Update, Profile, DeviceIoType.Input));
                 }
             }
-            
+
             plugin.SetProfile(Profile);
-            if (state != null) plugin.State = state.Value;
             Plugins.Add(plugin);
 
             Profile.Context.ContextChanged();
@@ -145,6 +183,23 @@ namespace HidWizards.UCR.Core.Models
         #endregion
 
 
+        internal Mapping CreateShadowClone(int shadowCloneNumber)
+        {
+            var clonedMapping = Context.DeepXmlClone<Mapping>(this);
+            clonedMapping.Title = $"{clonedMapping.Title} (Shadow {shadowCloneNumber})";
+            clonedMapping.IsShadowMapping = true;
+            clonedMapping.ShadowDeviceNumber = shadowCloneNumber;
+            clonedMapping.Profile = Profile;
+            clonedMapping.PostLoad(Profile.Context, Profile);
+
+            foreach (var plugin in clonedMapping.Plugins)
+            {
+                plugin.Filters.ForEach(f => f.Name = Filter.GetShadowName(f.Name, shadowCloneNumber));
+            }
+
+            return clonedMapping;
+        }
+
         internal void PostLoad(Context context, Profile profile = null)
         {
             Profile = profile;
@@ -156,15 +211,6 @@ namespace HidWizards.UCR.Core.Models
             foreach (var plugin in Plugins)
             {
                 plugin.PostLoad(context, profile);
-            }
-        }
-
-        internal void InitializeMappings(int amount)
-        {
-            DeviceBindings = new List<DeviceBinding>();
-            for (var i = 0; i < amount; i++)
-            {
-                DeviceBindings.Add(new DeviceBinding(Update, Profile, DeviceIoType.Input));
             }
         }
     }
